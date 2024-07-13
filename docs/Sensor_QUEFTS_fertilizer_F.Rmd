@@ -1,0 +1,1254 @@
+
+```{r}
+############################################################
+#31/01/2023
+###Tadesse Gashaw Asrat and Timo Breure 
+#### Article Title:- Spectral soil analysis for fertilizer recommendations by coupling with QUEFTS for maize in East Africa: a sensitivity analysis
+rm(list = ls())
+gc()
+set.seed(26354)
+
+# Target variables and spectra scanning instruments
+var_1 <- c("pH", "Olsen_P", "TotalN", "SOC", "Exch.K")
+labelspc_list <- c("FS4 CP","FS4 ML","NeoSpec","Tensor-II")
+# set working directory
+getwd()
+setwd("D:/QUEFTS_submission_R")
+lf <- list.files(pattern = ".csv")
+lf
+
+library(pls)
+library(tidyverse)
+library(prospectr)
+library(resemble)
+library(clhs)
+library(scales)
+library(cowplot)
+library(gridExtra)
+library(grid)
+library("psych")
+library(viridis)
+
+# Note the order in which the files are read in;
+# "ChemAll_data.csv"  "ContFSpec.csv"     "MuglFSpec.csv"     "NeoSPC.csv"        "TensorGeoN_av.csv" "TensorICGRF.csv"
+Spc_l <- lapply(2:6,
+                function (x)
+                  read.csv(lf[x],
+                           check.names = F))
+
+
+WCh_df <- read.csv(lf[1])
+WCh_df$ID <- as.character(WCh_df$ID)
+###Conversion of mmol K to cmol K per kg soil for QUEFTS input.
+WCh_df$Exch.K <- 10*WCh_df$Exch.K
+
+# Write ID columns as character vector
+for (i in 1:length(Spc_l)){
+  Spc_l[[i]]$ID <- as.character(Spc_l[[i]]$ID)
+}
+
+############################################################
+#data cleaning.
+# Subsetting
+sub_test = subset(Spc_l[[4]]$ID, 
+                  !(Spc_l[[4]]$ID %in% Spc_l[[5]]$ID)) # No duplicate IDs
+
+# Align ICRF samples by interpolation
+# Align ICRF MIR readings at different times by interpolation
+temp1 <- Spc_l[[4]][,2:ncol(Spc_l[[4]])]
+temp2 <- Spc_l[[5]][,2:ncol(Spc_l[[5]])]
+merg_df <- as.data.frame(prospectr::resample(temp1,
+                                             as.numeric(colnames(temp1)),
+                                             as.numeric(colnames(temp2))))
+
+temp1 <- cbind(Spc_l[[4]]$ID,merg_df)
+colnames(temp1)[1] <- "ID"
+temp1$ID <- as.character(temp1$ID)
+
+# Rbind two data frames (since there are no duplicates)
+temp3 <- rbind(temp1,
+               Spc_l[[5]])
+
+# Merge all dataframes to get ID vector common to three datasets
+Spc_l2 <- list(Spc_l[[1]],Spc_l[[2]],
+               Spc_l[[3]],temp3)
+
+index <- merge(merge(Spc_l2[[2]],
+                     Spc_l2[[1]],
+                     by = c("ID")),
+               merge(Spc_l2[[3]],
+                     Spc_l2[[4]],
+                     by = c("ID")))
+
+# Merge Wet chemistry data
+Spc_l2 <- lapply(Spc_l2,
+                 function (z)
+                   merge(WCh_df,
+                         z,
+                         by = c("ID"),
+                         drop = F))
+
+# Subset to index ID column
+for(i in 1:length(Spc_l2)){
+  Spc_l2[[i]] <- Spc_l2[[i]][Spc_l2[[i]]$ID %in% index$ID, ]
+}
+
+
+lapply(Spc_l2,
+       function (z)
+         print(dim(z)))
+
+# Remove rows where variables == NA
+for(i in 1:length(Spc_l2)){
+  Spc_l2[[i]] <- Spc_l2[[i]][complete.cases(Spc_l2[[i]][,c(var_1)]), ]
+}
+
+############################################################
+# Spectral pre-processing -------------------------------------------------
+# Write spectra as sub-dataframe (if all wavebands are retained!)
+spc_subdf <- function(df){
+  spc <- as.matrix(df[,42:ncol(df)])
+  df <- df[,-c(42:ncol(df))]
+  df$spc <- spc
+  return(df)
+}
+
+Spc_l2 <- lapply(Spc_l2,
+                 function (z)
+                   spc_subdf(z))
+
+# Convert NeoSpc wavenumbers to wavelength
+colnames(Spc_l2[[3]]$spc) <- round(10000000/as.numeric(colnames(Spc_l2[[3]]$spc)),1)
+
+# Invert the column order for the Neospc spectral matrix
+Spc_l2[[3]]$spc <- Spc_l2[[3]]$spc[,order(ncol(Spc_l2[[3]]$spc):1)]
+
+#reflectance to absorbance
+Spc_l2[[1]]$spc <- log10(1/Spc_l2[[1]]$spc)
+
+Spc_l2[[2]]$spc <- log10(1/Spc_l2[[2]]$spc)
+
+sshifts = c(1000, 1800)
+
+# spliceCorrection function for the FS4 and not for NeoSpec
+for (i in 1:2){
+  Spc_l2[[i]]$spc <- spliceCorrection(X = Spc_l2[[i]]$spc,
+                                      wav = as.numeric(colnames(Spc_l2[[i]]$spc)),
+                                      splice = sshifts)
+}
+
+Spc_proc <- function(df, w_nr){
+  df$sg <- savitzkyGolay(df$spc, p = 1, w = w_nr, m = 0)
+  df$snv <- standardNormalVariate(X = df$sg)
+  df$sgD1 <- savitzkyGolay(df$spc, p = 1, w = w_nr, m = 1)
+  df$gapD1 <- gapDer(X = df$sg, m = 1, w = w_nr, s = 7)
+  df$snv_d2 <- gapDer(X = df$snv, m = 2, w = 11)
+  return(df)
+}
+
+w_nr_l <- c(11, 11, 5, 11) ### order coincide with the instruments.
+
+Spc_l2 <- lapply(1:length(Spc_l2),
+                 function (z)
+                   Spc_proc(Spc_l2[[z]],
+                            w_nr = w_nr_l[z]))
+
+for (i in 1:length(Spc_l2)){
+  print(dim(Spc_l2[[i]]$sg))
+}
+
+# Write function
+removebands <- function(df,uplim,lolim){
+  df$spc <- df$spc[,c((colnames(df$spc) > uplim | colnames(df$spc) < lolim))]
+  df$sg <- df$sg[,c((colnames(df$sg) > uplim | colnames(df$sg) < lolim))]
+  df$snv <- df$snv[,c((colnames(df$snv) > uplim | colnames(df$snv) < lolim))]
+  df$sgD1 <- df$sgD1[,c((colnames(df$sgD1) > uplim | colnames(df$sgD1) < lolim))]
+  df$gapD1 <- df$gapD1[,c((colnames(df$gapD1) > uplim | colnames(df$gapD1) < lolim))]
+  df$snv_d2 <- df$snv_d2[,c((colnames(df$snv_d2) > uplim | colnames(df$snv_d2) < lolim))]
+  return(df)
+}
+
+
+for (i in 1:length(Spc_l2)){
+  print(dim(Spc_l2[[i]]$spc))
+}
+
+
+# H2O bands #1 visNIR region--- 7900 wn = 1350 nm ; # 6849 = 1460 nm
+tmpSpc_l1 <- lapply(1:3, 
+                    function (z) 
+                      removebands(Spc_l2[[z]],1460,1350)
+)
+
+# H2O bands #2 visNIR region --- 5587 wn = 1790 nm;  5102 wn = 1960 nm
+tmpSpc_l1 <- lapply(1:3, 
+                    function (z) 
+                      removebands(tmpSpc_l1[[z]],1960,1790)
+)
+
+# CO2 bands MIR Region # 2340 wn = 4274 nm; # 2240 wn = 4464 nm
+tmpSpc_l2 <- removebands(Spc_l2[[4]],4464,4274)
+
+
+Spc_l2 <- list(tmpSpc_l1[[1]], tmpSpc_l1[[2]],
+               tmpSpc_l1[[3]], tmpSpc_l2)
+
+
+for (i in 1:length(Spc_l2)){
+  print(dim(Spc_l2[[i]]$spc))
+}
+
+### Subset bands
+uplim_l <- c(500,500,1300)
+
+for (i in 1:2) {
+  Spc_l2[[i]] <- removebands(Spc_l2[[i]], uplim_l[i],
+                             2450)
+}
+
+# Overwrite function for lower limit
+removebands <- function(df,lolim){
+  df$spc <- df$spc[,c(colnames(df$spc) < lolim)]
+  df$sg <- df$sg[,c(colnames(df$sg) < lolim)]
+  df$snv <- df$snv[,c(colnames(df$snv) < lolim)]
+  df$sgD1 <- df$sgD1[,c(colnames(df$sgD1) < lolim)]
+  df$gapD1 <- df$gapD1[,c(colnames(df$gapD1) < lolim)]
+  df$snv_d2 <- df$snv_d2[,c(colnames(df$snv_d2) < lolim)]
+  return(df)
+}
+
+Spc_l2[[3]] <- removebands(Spc_l2[[3]],2450)
+
+############################################################
+#PCA analysis and splitting the data (Kennard-Stone sampling; cHLS sampling and multivariate soil property) ---------------------------------
+
+pcspectra <- lapply(1:length(Spc_l2),
+                    function (x)
+                      pc_projection(Xr = Spc_l2[[x]]$sgD1, # index to spectral dataframe 
+                                    pc_selection = "var",
+                                    center = T, scaled = F,
+                                    method = "pca"))
+
+
+pcdf_l <- lapply(1:length(Spc_l2),
+                 function (i)
+                   data.frame(SC1 = pcspectra[[i]]$scores[,1], # save PCA scores
+                              SC2 = pcspectra[[i]]$scores[,2],
+                              V1 = c(pcspectra[[i]]$variance$x_var[3,1]), # save variance explained
+                              V2 = c(pcspectra[[i]]$variance$x_var[3,2]),
+                              Spc = c(labelspc_list[[i]]),
+                              SOC = Spc_l2[[1]]$SOC-mean(Spc_l2[[1]]$SOC),
+                              Country = Spc_l2[[1]]$Country))
+
+
+PCdf_spc <- do.call(rbind, pcdf_l)
+
+# Bind PCs retained for sampling 
+# Only from VNIR dataframes
+PC_KS_df <- cbind(pcspectra[[1]]$scores,
+                  cbind(pcspectra[[2]]$scores,
+                        pcspectra[[3]]$scores))
+
+## conditional latin hypercubic sampling
+clhs_df1 <- clhs(x = as.data.frame(PC_KS_df), 
+                 size = round(nrow(PC_KS_df)*0.75), 
+                 iter = 10000, simple = FALSE)
+
+############################################################
+# PLS Regression with cLHS plitting of the dataset ----------------------------------------------------------
+Spc_train <- lapply(Spc_l2,
+                    function (x)
+                      x[clhs_df1$index_samples,])
+
+Spc_test <- lapply(Spc_l2,
+                   function (x)
+                     x[-clhs_df1$index_samples,])
+
+#
+var_l <- c("Exch.K", "Olsen_P", "pH", "SOC", "TotalN")
+sensor_l <- labelspc_list
+# PLSR and bootstrapping loop ----------------------------------------------------------
+
+for (jj in 1:2){ # 2*5000 bootstrap iterations
+  
+  for (xx in 1:length(var_l)){
+    
+    var_4 <- c(var_l[[xx]]) 
+    
+    # lapply to store pls results as mvr objects run for each variable list
+    models_nsc <- lapply(1:length(Spc_train),
+                         function (z)
+                           lapply(1:length(var_4), # change var here
+                                  function (x) 
+                                    plsr(Spc_train[[z]][,c(var_4[[x]])]~sgD1, # change var here
+                                         scale = F, trace = TRUE, 
+                                         data = Spc_train[[z]], ncomp = 15, 
+                                         validation = "CV",
+                                         segments = 10,
+                                         jackknife = T)
+                           )
+    )
+    
+    
+    # Plot diagnostics
+    min.RMSE.out <- lapply(1:length(models_nsc),
+                           function (z)
+                             lapply(1:length(models_nsc[[z]]),
+                                    function (x)
+                                      which.min(
+                                        as.data.frame(
+                                          RMSEP(
+                                            models_nsc[[z]][[x]])$val)[1,2:16])))
+    
+    # Plotting loadings
+    
+    # Writing loadings to data.frame
+    load_tmp <- lapply(1:length(models_nsc),
+                       function (z)
+                         lapply(1:length(models_nsc[[z]]),
+                                function (ii)
+                                  as.data.frame(models_nsc[[z]][[ii]]$loadings[,1:2]) %>%
+                                  mutate(.,
+                                         Sensor = c(sensor_l[[z]]),
+                                         Soil_property = c(var_4),
+                                         Wav = as.numeric(colnames(Spc_train[[z]]$sgD1)))
+                         ))
+    
+        # }
+    
+    # Bootstrapping -----------------------------------------------------------
+    ### Non parametric bootstrap
+    boot_res <- function(pls_mod, train_df, Yu, Xu, 
+                         ncomp, min_ncomp, 
+                         val_df,
+                         iterations){
+      
+      
+      # h0_f <- function (pls.object,Xu) {
+      
+      Ysc <- as.matrix(
+        predict(pls_mod,
+                newdata = train_df,
+                type = c("scores")
+        )
+      )
+      
+      Xsc <- pls_mod$scores
+      
+      H <- Ysc %*% solve(t(Xsc) %*% Xsc) %*% t(Ysc)
+      lev.pls <- diag(H) # In case Yscores are a matrix (such as in calibration set)
+      
+      #return(H)
+      
+      # }
+      
+      sc_res <- data.frame(pls_mod$residuals)[,min_ncomp]/sqrt(1-lev.pls)
+      
+      sc_res <- sc_res - mean(sc_res) # 
+      
+      # Notes:
+      # Validation set used compute predicted residual sum of squares (press)
+      coefs <- array(0, dim=c((ncol(train_df[,Xu])+1), iterations, ncomp)) # + intercept
+      press.out <- array(data=NA, dim=c(iterations, ncomp))
+      btstrp.out <- array(data=NA, dim=c(nrow(train_df), iterations))
+      # loadings.out <- NULL
+      
+      
+      for (i in 1:iterations){
+        
+        # Make bootstrap residuals
+        ep.strp <- sample(sc_res,
+                          size=nrow(pls_mod$residuals),
+                          replace=TRUE)
+        
+        # Make bootstrap Y
+        y.strp <- data.frame(pls_mod$fitted.values)[,min_ncomp] + ep.strp
+        
+        # overwrite original values in training dataset
+        train_df[,c(paste(Yu, "_b", sep = ""))] <- y.strp
+        
+        # Perform bootstrap regression
+        pls.strp <- plsr(as.formula(paste(Yu,"_b~",Xu, sep = "")),
+                         data = train_df, ncomp = ncomp,
+                         scale = F, center = T)
+        
+        pred.val <- predict(pls.strp, newdata = val_df)
+        
+        sq_resid <- (as.data.frame(pred.val)-val_df[,Yu])^2
+        
+        press.out[i,] <- colSums(sq_resid)
+        
+        coefs[,i,] <- coef(pls.strp, intercept = T, ncomp = 1:ncomp)
+        
+        # loadings.out[[i]] <- as.data.frame(pls.strp$loadings[,1:2])
+        
+        rm(ep.strp, y.strp, pls.strp, pred.val, sq_resid)
+        
+        
+      }  
+      
+      return(list(press=press.out,
+                  coef_array=coefs))
+    }
+    
+    btstrp_mod <- lapply(1:length(models_nsc),
+                         function (x)
+                           lapply(1:length(models_nsc[[x]]),
+                                  function (i)
+                                    boot_res(models_nsc[[x]][[i]],
+                                             Spc_train[[x]],
+                                             var_4[i],
+                                             "sgD1",
+                                             15,
+                                             min.RMSE.out[[x]][[i]],
+                                             Spc_test[[x]],
+                                             5000)))
+    
+    
+    for (j in 1:length(models_nsc)){
+      for (ii in 1:length(models_nsc[[j]])){
+        
+        saveRDS(btstrp_mod[[j]][[ii]]$coef_array[1,,min.RMSE.out[[j]][[ii]]], 
+                paste(Soil_property = c(var_4[ii]),
+                      Sensor = labelspc_list[[j]],
+                      "V",jj,
+                      "btstrp_Int.rds", sep = "_"))
+        
+        saveRDS(btstrp_mod[[j]][[ii]]$coef_array[2:length(btstrp_mod[[j]][[ii]]$coef_array[,1
+                                                                                           ,
+                                                                                           min.RMSE.out[[j]][[ii]]]),
+                                                 ,min.RMSE.out[[j]][[ii]]], 
+                paste(Soil_property = c(var_4[ii]),
+                      Sensor = labelspc_list[[j]],
+                      "V",jj,
+                      "btstrp_Coef.rds", sep = "_"))
+        
+      }
+    }
+    
+    
+    rm(btstrp_mod)
+    
+    print(paste(length(var_l)-xx,"to go ..."))
+    
+  } # soil properties loop
+} # number of btstrp per soil property-sensor combination (2*5000)
+
+#############################################################
+# Post bootstrap code -----------------------------------------------------
+# After loop, run these lines
+
+btstrp_Int <- list.files(pattern = "btstrp_Int.rds")
+
+btstrp_coef <- list.files(pattern = "btstrp_Coef.rds")
+
+coef_array_l <- lapply(1:length(btstrp_Int),
+                       function (x)
+                         rbind(t(readRDS(btstrp_Int[[x]])), # transpose intercept vector
+                               readRDS(btstrp_coef[[x]])))
+
+coef_array_l2 <- lapply(seq(1,40, by=2),
+                        function (x)
+                          cbind(coef_array_l[[x]],
+                                coef_array_l[[x+1]]))
+
+# remove and free up memory
+rm(coef_array_l)
+gc() 
+
+# Function to compute bias-corrected confidence interval
+CI_fun <- function(coef_array, val_df, 
+                   Yu, Xu, exp_b){
+  
+  strp.intercept <- coef_array[1, ]
+  
+  strp.coef <- coef_array[2:nrow(coef_array), ]
+  
+  interval <- c(0.025, 0.975)
+  
+  strp.pred <- val_df[,Xu] %*% strp.coef + matrix(rep(strp.intercept,
+                                                      length(val_df[,Yu])),
+                                                  byrow = T,
+                                                  ncol = length(strp.intercept))
+  
+  
+  b = sapply(1:nrow(strp.pred),
+             function (x)
+               qnorm((sum(strp.pred[x,] > mean(strp.pred[x,]))/ncol(strp.pred)))) # ncol == bootstrap iterations
+  b
+  alpha=0.05 # 95% limits
+  z=qnorm(c(alpha/2,1-alpha/2)) # Std. norm. limits
+  p=pnorm(z-2*mean(b)) # bias-correct & convert to proportions
+  
+  exp_ch <- exp_b
+  
+  # Confidence interval
+  # If else statement in case of log transform
+  if(exp_ch == 1){
+    C.int <- apply(X = exp(strp.pred),
+                   MARGIN = 1, FUN = quantile,
+                   probs = c(p[1], p[2]))
+  }else{
+    C.int <- apply(X = strp.pred,
+                   MARGIN = 1, FUN = quantile,
+                   probs = c(p[1], p[2]))
+  }
+  
+  return(C.int)
+  
+}
+
+# Set order of .rds files
+var_l <- c("Exch.K", "Olsen_P", "pH", "SOC", "TotalN")
+sensor_l <- c("CP", "ML", "NeoSpec", "Tensor-II")
+expb_l <- c(0, 1, 0, 0, 0) # vector indicating whether variable has been log-transformed
+
+# Create nested list (sensor - soil property)
+nested_l <- list(seq(1,20,by=4),seq(2,20,by=4),seq(3,20,by=4),seq(4,20,by=4))
+
+coef_nest <- vector("list", 4)
+for (i in 1:length(nested_l)){
+  coef_nest[[i]] <- list(coef_array_l2[[nested_l[[i]][1]]],
+                         coef_array_l2[[nested_l[[i]][2]]],
+                         coef_array_l2[[nested_l[[i]][3]]],
+                         coef_array_l2[[nested_l[[i]][4]]],
+                         coef_array_l2[[nested_l[[i]][5]]])
+}
+
+# Compute bias-corrected CIs
+Interval_Conf <- lapply(1:length(coef_nest),
+                        function (x)
+                          lapply(1:length(coef_nest[[x]]),
+                                 function (i)
+                                   CI_fun(coef_nest[[x]][[i]], 
+                                          Spc_test[[x]],
+                                          var_l[i],
+                                          "sgD1",
+                                          expb_l[i])))
+
+# Compute correction factors
+corr_f <- function (NRcal, pH_hat){ # I.e. a data.frame that has predicted pH 
+  
+  ##K unit conversion
+  ###pH correction factor for N based on Sattari et.al. (2014)
+  NRcal$fNi <- round(ifelse(pH_hat < 4.7, 
+                            0.4, 
+                            ifelse(pH_hat <= 7 & pH_hat >= 4.7, 
+                                   0.25*(pH_hat-3),
+                                   1))
+                     ,2)
+  
+  ###pH correction factor for P
+  NRcal$fPi <- round(ifelse(pH_hat < 4.7, 
+                            0.02, 
+                            ifelse(pH_hat <= 6 & pH_hat >= 4.7, 
+                                   1-0.5*((pH_hat-6)^2),
+                                   ifelse(pH_hat <= 6.7 & pH_hat >= 6, 
+                                          1,
+                                          ifelse(pH_hat <= 8 & pH_hat >= 6.7,
+                                                 1-0.25*((pH_hat-6.7)^2),
+                                                 0.57))))
+                     ,2)
+  
+  
+  ###pH correction factor for K
+  NRcal$fKi <- round(ifelse(pH_hat < 4.5, 
+                            1, 
+                            ifelse(pH_hat <= 6.8 & pH_hat >= 4.5, 
+                                   6.1*((pH_hat)^-1.2),
+                                   0.6))
+                     ,2)
+  
+  
+  # Constants based on Rurinda et al. (2020); Sattari et.al. (2014)
+  # NR
+  NRcal$NRn <- 1000/((((34+27)/2) +((98+80)/2))/2)
+  NRcal$NRp <-1000/((((194+90)/2) +((505+537)/2))/2)
+  NRcal$NRk <-1000/((((30+16)/2) +((126+87)/2))/2)
+  
+  ##RE
+  NRcal$REn <- 0.5
+  NRcal$REp <- 0.3 
+  NRcal$REk <-0.5
+  
+  return(NRcal)
+}
+
+
+# Compute prediction intervals
+PI_fun <- function(coef_array, 
+                   val_df, Yu, Xu,
+                   exp_b){
+  
+  strp.intercept <- coef_array[1,]
+  
+  strp.coef <- coef_array[2:nrow(coef_array),]
+  
+  strp.pred <- val_df[,Xu] %*% strp.coef + matrix(rep(strp.intercept,
+                                                      length(val_df[,Yu])),
+                                                  byrow = T,
+                                                  ncol = length(strp.intercept))
+  
+  exp_c <- exp_b
+  
+  # Prediction interval (known values of validation set required)
+  if(exp_c == 1){
+    mu_hat <- apply(X = exp(strp.pred), MARGIN = 1, FUN = mean)}
+  else {
+    mu_hat <- apply(X = strp.pred, MARGIN = 1, FUN = mean)  
+  }
+  
+  val_df$Res_hat <- mu_hat-val_df[,Yu] # Yu_hat is specified as a vector within a data.frame
+  
+  
+  # law of total variance
+  # standard deviation in predictions
+  if(exp_c == 1){
+    sigma_u <- apply(X = exp(strp.pred), MARGIN = 1, FUN = sd)}
+  else {
+    sigma_u <- apply(X = strp.pred, MARGIN = 1, FUN = sd)  
+  }
+  
+  sigma_res <- sd(val_df$Res_hat)
+  
+  sd_tot <- sqrt(sigma_u^2+sigma_res^2) # Add variances and take square root, to get sd
+  
+  sd_tot
+  
+  return(sd_tot)
+  
+  
+}
+
+# Compute sd based on estimated variance and bias
+SD_tot <- lapply(1:length(coef_nest),
+                 function (x)
+                   lapply(1:length(coef_nest[[x]]),
+                          function (i)
+                            PI_fun(coef_nest[[x]][[i]],
+                                   Spc_test[[x]],
+                                   var_l[i],
+                                   "sgD1",
+                                   expb_l[i])))
+
+# Get mean from bootstrap predictions
+mu_fun <- function(coef_array, 
+                   val_df, Yu, Xu,
+                   exp_b){
+  
+  strp.intercept <- coef_array[1,]
+  
+  strp.coef <- coef_array[2:nrow(coef_array),]
+  
+  strp.pred <- val_df[,Xu] %*% strp.coef + matrix(rep(strp.intercept,
+                                                      length(val_df[,Yu])),
+                                                  byrow = T,
+                                                  ncol = length(strp.intercept))
+  
+  
+  exp_c <- exp_b
+  
+  # law of total variance
+  if(exp_c == 1){
+    mu <- apply(X = exp(strp.pred), MARGIN = 1, FUN = mean)}
+  else {
+    mu <- apply(X = strp.pred, MARGIN = 1, FUN = mean)  
+  }
+  
+  return(mu)
+}
+
+# Get means
+Mu_tot <- lapply(1:length(coef_nest),
+                 function (x)
+                   lapply(1:length(coef_nest[[x]]),
+                          function (i)
+                            mu_fun(coef_nest[[x]][[i]],
+                                   Spc_test[[x]],
+                                   var_l[i],
+                                   "sgD1",
+                                   expb_l[i])))
+
+var_l2 <- paste(var_l,"hat",sep = "_")
+
+# Write all prediction metrics to single data.frame()
+# Derive sd from confidence intervals
+# I.e. CI_SD
+btstrp_df <- lapply(1:length(coef_nest),
+                    function (x)
+                      lapply(1:length(coef_nest[[x]]),
+                             function (i) {
+                               Spc_test[[x]] %>% 
+                                 bind_cols(.,
+                                           data.frame(
+                                             hat = c(Mu_tot[[x]][[i]]),           
+                                             LCI = c(Interval_Conf[[x]][[i]][1,]),
+                                             UCI = c(Interval_Conf[[x]][[i]][2,]),
+                                             LPI = c(Mu_tot[[x]][[i]]-1.96*SD_tot[[x]][[i]]),
+                                             UPI = c(Mu_tot[[x]][[i]]+1.96*SD_tot[[x]][[i]]),
+                                             SD = SD_tot[[x]][[i]],
+                                             Soil_property = c(var_l[i]),
+                                             Sensor = (sensor_l[x]))) %>% 
+                                 mutate(.,
+                                        CI_SD = (UCI-LCI)/3.92) %>% 
+                                 dplyr::select(.,
+                                               all_of(var_l),
+                                               hat, LCI, UCI, LPI, UPI,
+                                               SD, CI_SD, Soil_property, Sensor, Country)
+                             }
+                      )
+)
+
+# Functions
+depth <- function(this) ifelse(is.list(this), 1L + max(sapply(this, depth)), 0L)
+
+bind_at_any_depth <- function(l) {
+  if (depth(l) == 2) {
+    return(bind_rows(l))
+  } else {
+    l <- map_depth(l, depth(l) - 2, bind_rows)
+    bind_at_any_depth(l)
+  }
+}
+# Bind dataframes from nested list
+btstrp_all <- bind_at_any_depth(btstrp_df)
+
+# Compute prediction metrics for the mean error by each soil property
+btstrp_all_sub <- lapply(1:length(var_l),
+                         function (x){
+                           btstrp_all %>% 
+                             dplyr::filter(Soil_property == var_l[x]) %>% 
+                             dplyr::mutate(.,
+                                           Measured = btstrp_all[btstrp_all$Soil_property == var_l[x],
+                                                                 c(var_l[x])]) %>% 
+                             dplyr::select(.,
+                                           Measured,
+                                           hat, LCI, UCI, LPI, UPI,
+                                           SD, CI_SD, Soil_property, Sensor, Country) %>% 
+                             group_by(.,
+                                      Sensor) %>% 
+                             mutate(.,
+                                    MSE = signif(mean((hat-Measured)^2),2),
+                                    var_E = var((hat-Measured)),
+                                    RMSE = signif(sqrt(mean((hat-Measured)^2)),2),
+                                    RMSE_sd = sd(sqrt((hat-Measured)^2)),
+                                    CCC = epiR::epi.ccc(hat,Measured)$rho.c$est,
+                                    Bias = signif(mean(Measured - hat),2),
+                                    SEP = sqrt(sum((Measured-hat)^2)/n()),
+                                    IQ = (quantile(Measured, 
+                                                   probs = 0.75)-quantile(Measured,
+                                                                          probs = 0.25))) %>%
+                             mutate(.,
+                                    RPIQ = signif((IQ/SEP),2))
+                         })
+
+btstrp_all2 <- do.call("rbind", btstrp_all_sub) # rbind list
+
+# Recode to allow for subscripts in labels
+btstrp_all2 <- btstrp_all2 %>% 
+  dplyr::ungroup(.) %>% 
+  dplyr::mutate(.,
+                Soil_property = dplyr::recode(Soil_property,
+                                              "Exch.K" = "K[exch]",
+                                              "Olsen_P" = "P[exch]",
+                                              "pH" = "pH",
+                                              "SOC" = "SOC",
+                                              "TotalN" = "N[tot]"))
+
+
+# Facet_limits for equal x and y axes
+FacetLims <- btstrp_all2 %>% 
+  dplyr::group_by(Soil_property,Sensor) %>% 
+  dplyr::summarize(min = min(Measured, LCI),
+                   max = max(Measured, UCI)) %>% 
+  gather(range, Measured, -Soil_property, -Sensor) %>% 
+  dplyr::mutate(hat = Measured, range = NULL)
+
+# Plot predictions with 95% confidence intervals, bias corrected 
+png(filename = "CI_PLS_predictions.png", height = 6, width =7, units = "in",
+    res = 400)
+ggplot(btstrp_all2,
+       aes(hat,Measured))+
+  facet_wrap(Sensor~Soil_property,
+             scales = "free",
+             labeller = labeller(.cols = label_parsed,
+                                 .multi_line = F))+
+  geom_errorbar(aes(xmin=LCI,
+                    xmax=UCI),
+                color = "darkslategray",
+                position = position_dodge(.5))+
+  geom_blank(data = FacetLims, aes(hat, Measured))+
+  geom_point()+
+  geom_abline(intercept = 0, slope = 1)+
+  ylab("Measured")+
+  xlab("Predicted")+
+  geom_text(x = Inf, y = -Inf,
+            label = paste("CCC :",
+                          signif(btstrp_all2$CCC, 2)),
+            vjust = -4.5, hjust = 1, size = 3, color = "black")+
+  geom_text(x = Inf, y = -Inf,
+            label = paste("RMSE :",
+                          signif(btstrp_all2$Bias, 2)),
+            vjust = -3.1, hjust = 1, size = 3, color = "black")+
+  geom_text(x = Inf, y = -Inf,
+            label = paste("Bias :",
+                          signif(btstrp_all2$Bias, 2)),
+            vjust = -0.3, hjust = 1, size = 3, color = "black")+
+  geom_text(x = Inf, y = -Inf,
+            label = paste("RPIQ :",
+                          signif(btstrp_all2$RPIQ)),
+            hjust = 1, vjust = -1.7, size = 3, color = "black")+
+  scale_color_manual(name = 'Legend',
+                     values =c('firebrick'='firebrick'),
+                     labels = c('Bias corrected - 95% Confidence interval'))+
+  #theme(legend.position = "top")+
+  theme_classic()
+dev.off()  
+
+############################################################
+# Compute correction factors and constants for each data frame ------------
+
+rm(Interval_Conf, coef_array_l2, SD_tot, Mu_tot)
+gc()
+
+# Nested list of length 3, i.e. LCI, Mean, UCI
+# To allow for propagation of Olsen P CIs in QUEFTS
+pH_l <- lapply(1:length(btstrp_df),
+               function (x)
+                 btstrp_df[[x]][[3]])
+
+SOC_l <- lapply(1:length(btstrp_df),
+                function (x)
+                  btstrp_df[[x]][[4]])
+
+P_l <- lapply(1:length(btstrp_df),
+              function (x)
+                list(btstrp_df[[x]][[2]],btstrp_df[[x]][[2]],btstrp_df[[x]][[2]]))
+
+err_l <- c("LCI","hat","UCI")
+P_corr <- lapply(1:length(P_l),
+                 function (x)
+                   lapply(1:length(P_l[[x]]),
+                          function (i)
+                            corr_f(P_l[[x]][[i]],
+                                   pH_l[[x]][,c(err_l[i])])))
+
+
+## pH correction factor is assumed to have no error variance even though it is based on PLSR predicted pH
+btstrp_df <- lapply(1:length(btstrp_df),
+                    function (x)
+                      lapply(1:length(btstrp_df[[x]]),
+                             function (i)
+                               corr_f(btstrp_df[[x]][[i]],
+                                      btstrp_df[[x]][[3]]$hat))) # Index estimated 'pH' data frame
+
+
+#############################################################
+
+### Calculating indigenous soil nutrient supply Sattari et.al. (2014)
+# Error propagation functions ---------------------------------------------
+# https://foothill.edu/psme/daley/tutorials_files/10.%20Error%20Propagation.pdf
+
+# Function to compute soil nutrient supply of P
+SPi_f <- function (fPi, SOC, P){
+  SPi <- fPi*0.35*SOC + (0.5*P)
+  
+  SPi
+}
+
+
+# Propagation of errors for soil phosphorus supply
+SPi_sig_f <- function (fPi, SOC, P, SOC_sig, P_sig) { # Correction factor, estimated soil property, sd estimate
+  SPi <- fPi*0.35*SOC + (0.5*P)
+  
+  delt_P <- fPi*0.35*SOC
+  
+  delt_P_sig <- sqrt(SOC_sig^2/SOC^2)*delt_P # compute first part 
+  
+  sig_SP <- sqrt(delt_P_sig^2 + (0.5*(P_sig^2)))
+  
+  sig_SP
+  
+} 
+
+# Function to compute soil nutrient supply of N
+SNi_f <- function(fNi, SOC){
+  
+  SNi <- fNi*6.8*SOC
+  
+  SNi
+  
+}
+
+# Propagation of errors for soil nitrogen supply
+SNi_sig_f <- function(fNi, SOC, sig){ # Correction factor, estimated soil property, sd estimate
+  
+  SNi <- fNi*6.8*SOC
+  
+  SNi_sig <- sqrt(sig^2/SOC^2)*SNi
+  
+  SNi_sig
+}
+
+# Fertilizer kg ha to apply 
+kgha_f <- function (S, NR, Ya, RE){
+  # NR; Ya RE are constants
+  # S is (estimated) soil nutrient supply
+  f_kgha <- (((NR*Ya)-S)/RE)
+  
+  f_kgha
+  
+}
+
+# Propagate uncertainty into recommended fertilizer
+kgha_sig <- function (S, S_sig, NR, Ya, RE){
+  
+  f_kgha <- (((NR*Ya)-S)/RE) # where S has an associated propagated error variance
+  
+  f_kgha_sig <- (S_sig^2/S^2)*f_kgha^2 
+  
+  sqrt(f_kgha_sig)
+  
+}
+
+############################################################
+# Propagate confidence intervals for Olsen P to account for log-transform
+# Compute fertilizer kg ha to apply and corresponding CI based on bootstrap CI and error propagation -------------------------------
+P_Spi <- lapply(1:length(P_corr),
+                function (x)
+                  lapply(1:length(P_corr[[x]]), # for the lower CI, mean and upper CI
+                         function (i)
+                           SPi_f(P_corr[[x]][[i]]$fPi,
+                                 SOC_l[[x]][,c(err_l[i])], # However, CIs from SOC are not accounted for!
+                                 P_corr[[x]][[i]][,c(err_l[i])])))
+
+
+kgP_l <- lapply(1:length(P_l),
+                function (x)
+                  lapply(1:length(P_l[[x]]),
+                         function (i)
+                           kgha_f(P_Spi[[x]][[i]],
+                                  P_corr[[x]][[i]]$NRp,
+                                  7,
+                                  P_corr[[x]][[i]]$REp)))
+
+
+############################################################
+# Nitrogen ----------------------------------------------------------------
+# Write values to data.frame, where the indices in the 2nd nested list correspond
+# to the order in the 'var_l' vector
+Out <- lapply(1:length(btstrp_df),
+              function (i){
+                btstrp_df[[i]][[5]] %>% 
+                  mutate(.,
+                         SNi_est = sapply(1:nrow(btstrp_df[[i]][[5]]),
+                                          function (x)
+                                            SNi_f(fNi = btstrp_df[[i]][[5]][x,c("fNi")],
+                                                  SOC = btstrp_df[[i]][[4]][x,c("hat")])),
+                         SNi_sig = sapply(1:nrow(btstrp_df[[i]][[5]]),
+                                          function (x)
+                                            SNi_sig_f(fNi = btstrp_df[[i]][[5]][x,c("fNi")],
+                                                      SOC = btstrp_df[[i]][[4]][x,c("hat")], # Index estimated SOC dataframe
+                                                      sig = btstrp_df[[i]][[4]][x,c("CI_SD")])), # Equally here
+                         SOC_hat = btstrp_df[[i]][[4]][,c("hat")],
+                         SOC_sig = btstrp_df[[i]][[4]][,c("CI_SD")]) %>% 
+                  mutate(.,
+                         Ni_est = kgha_f(SNi_est, NRn, 7, REn),
+                         Ni_sig = kgha_sig(SNi_est, SNi_sig, NRn, 7, REn)) %>% 
+                  mutate(Ni_LSD = Ni_est - Ni_sig,
+                         Ni_USD = Ni_est + Ni_sig) %>% 
+                  mutate(.,
+                         Sensor = sensor_l[[i]])
+              }
+)
+
+for (i in 1:length(Out)){
+  tmp <- ecdf(Out[[i]]$Ni_sig)
+  Out[[i]]$Pcdf <- tmp(Out[[i]]$Ni_sig)
+}
+
+
+# Compute the same metrics for the 'true values' 
+Out_obs <- lapply(1:length(Out),
+                  function (i)
+                    corr_f(Out[[i]] %>% # correction factor pH
+                             dplyr::select(.,
+                                           Exch.K, SOC, pH),
+                           Out[[i]]$pH))
+
+
+Out_obs <- lapply(1:length(Out_obs),
+                  function (x)
+                    Out_obs[[x]] %>% 
+                    mutate(.,
+                           SNi_obs = SNi_f(fNi, SOC)) %>% 
+                    mutate(.,
+                           Ni_obs = kgha_f(SNi_obs, NRn, 7, REn),
+                           Sensor = sensor_l[[x]]))
+
+# cbind the estimated and observed soil N supply + associated uncertainties
+Out_all <- cbind(do.call("rbind", Out),
+                 do.call("rbind", Out_obs)[,c("SNi_obs",
+                                              "Ni_obs")]) %>% 
+  group_by(.,
+           Sensor) %>% 
+  mutate(.,
+         MSE = signif(mean((Ni_est-Ni_obs)^2),2),
+         var_E = var((Ni_est-Ni_obs)),
+         RMSE = signif(sqrt(mean((Ni_est-Ni_obs)^2)),2),
+         RMSE_sd = sd(sqrt((Ni_est-Ni_obs)^2)),
+         CCC = epiR::epi.ccc(Ni_est,Ni_obs)$rho.c$est,
+         Bias = signif(mean(Ni_obs - Ni_est),2),
+         SEP = sqrt(sum((Ni_obs-Ni_est)^2)/n()),
+         diff_est = Ni_obs - Ni_est,
+         mean_N = (Ni_obs + Ni_est)/2,
+         lower = mean(diff_est) - (1.96*sd(diff_est)), #- mean(Ni_est),
+         upper = mean(diff_est) + (1.96*sd(diff_est)), #- mean(Ni_est),
+         min_LSD = diff_est -abs(Ni_LSD - Ni_est), #- diff_est,
+         max_LSD = diff_est + abs(Ni_USD - Ni_est), #- diff_est,
+         mmeandiff = mean(mean(Ni_obs) - mean(Ni_est)),
+         #SSE = sum((Ni_est - Ni_obs)^2, na.rm = T),
+         #SST = sum((Ni_obs - mean(Ni_obs, na.rm = T))^2, na.rm = T),
+         #R2 = round((1 - SSE/SST), digits = 2),
+         IQ = (quantile(Ni_obs, 
+                        probs = 0.75)-quantile(Ni_obs,
+                                               probs = 0.25))) %>%
+  mutate(.,
+         RPIQ = signif((IQ/SEP),2))
+
+# Plotting
+FacetLims <- Out_all %>%
+  dplyr::group_by(.,Sensor) %>%
+  dplyr::summarize(min = floor(min(Ni_LSD)),
+                   max = ceiling(max(Ni_USD))) %>%
+  gather(.,range, Ni_obs, -Sensor) %>%
+  dplyr::mutate(Ni_est = Ni_obs, range = NULL) %>% 
+  mutate(.,
+         Ni_obs = c(rep(200,4),rep(240,4)))
+
+
+# 1:1 plots
+png(filename = "Fig3.png", width = 6, height = 6, units = "in", res = 400)
+ggplot(Out_all,
+       aes(Ni_est, Ni_obs))+
+  geom_errorbar(aes(y = Ni_obs,
+                    xmin=Ni_LSD,
+                    xmax=Ni_USD), # These are the upper and lower SDs!
+                color = "darkslategray",
+                alpha = 0.5)+
+  geom_point()+
+  geom_abline(intercept = 0, slope = 1)+
+  xlim(190, 270)+
+  ylim(190, 270)+
+  geom_blank(data = FacetLims)+
+  geom_text(x = -Inf, y = Inf,
+            label = paste("MSE :",
+                          signif(Out_all$MSE)),
+            hjust = 0, vjust = 1.25, size = 3, color = "black")+
+  #geom_text(x = -Inf, y = Inf,
+  #          label = paste("R2 :",
+  #                        signif(Out_all$R2, 2)),
+  #          hjust = 0, vjust = 2.5, size = 3, color = "black")+
+  geom_text(x = -Inf, y = Inf,
+            label = paste("Bias :",
+                          signif(Out_all$Bias)),
+            parse = T, hjust = 0, vjust = 2.5, size = 3, color = "black")+
+  # geom_text(x = -Inf, y = Inf,
+  #           label = paste("RPIQ :",
+  #                         signif(Out_all$RPIQ)),
+  #           parse = T, hjust = 0, vjust = 4.7, size = 3, color = "black")+
+  facet_wrap(~Sensor,
+             scales = "free")+
+  xlab(c(expression(paste("Fertilizer N based on spectral predictions / kg ",ha^-1))))+
+  ylab(c(expression(paste("Fertilizer N based on conventional analysis / kg ",ha^-1))))
+dev.off()
+
+###################################################
+ggplot(Out_all,
+       aes(mean_N, diff_est))+
+  geom_errorbar(aes(y = diff_est,
+                    ymin=min_LSD,
+                    ymax=max_LSD), # These are the upper and lower SDs!
+                color = "darkslategray",
+                alpha = 0.5)+
+  geom_point()+
+  geom_hline(aes(yintercept = mmeandiff))+
+  geom_hline(aes(yintercept = lower), color = "black", linetype="dashed") +
+  geom_hline(aes(yintercept = upper), color = "black", linetype="dashed") +
+  facet_wrap(~Sensor)+
+  # xlim(205, 235)+
+  coord_cartesian(ylim=c(-60, 60))+
+  theme_bw()+
+  xlab(c(expression(paste("Mean of fertilizer ",N[conv]," and ",N[spec]," / kg ",ha^-1))))+
+  ylab(c(expression(paste("Fertilizer ",N[conv]-N[spec]," / kg ",ha^-1))))
+
+
+# Olsen P -----------------------------------------------------------------
+Out_P <- lapply(1:length(btstrp_df),
+                function (i){
+                  btstrp_df[[i]][[2]] %>% 
+                    mutate(.,
+                           SPi_est = sapply(1:nrow(btstrp_df[[i]][[2]]),
+                                            function (x)
+                                              SPi_f(fPi = btstrp_df[[i]][[2]][x,c("fPi")],
+                                                    SOC = btstrp_df[[i]][[4]][x,c("hat")],
+                                                    P = btstrp_df[[i]][[2]][x,c("hat")])),
+                           SPi_sig = sapply(1:nrow(btstrp_df[[i]][[2]]),
+                                            function (x)
+                                              SPi_sig_f(fPi = btstrp_df[[i]][[2]][x,c("fPi")],
+                                                        SOC = btstrp_df[[i]][[4]][x,c("hat")], # Index estimated SOC dataframe
+                                                        P = btstrp_df[[i]][[2]][x,c("hat")],
+                                                        P_sig = btstrp_df[[i]][[2]][x,c("CI_SD")],
+                                                        SOC_sig = btstrp_df[[i]][[4]][x,c("CI_SD")])), # Equally here
+                           SOC_hat = btstrp_df[[i]][[4]][,c("hat")],
+                           SOC_sig = btstrp_df[[i]][[4]][,c("CI_SD")]) %>% 
+                    mutate(.,
+                           Pi_est = kgha_f(SPi_est, NRp, 7, REp),
+                           Pi_sig = kgha_sig(SPi_est, SPi_sig, NRp, 7, REp)) %>% 
+                    mutate(Pi_LSD = Pi_est - Pi_sig,
+                           Pi_USD = Pi_est + Pi_sig)
+                }
+)
+
+for (i in 1:length(Out_P)){
+  tmp <- ecdf(Out_P[[i]]$Pi_sig)
+  Out_P[[i]]$Pcdf <- tmp(Out_P[[i]]$Pi_sig)
+}
+
+# Compute same for the 'true values'
+Out_obs_P <- lapply(1:length(Out_P),
+                    function (i)
+                      corr_f(Out_P[[i]] %>% # pH correction factor
+                               dplyr::select(.,
+                                             Exch.K, Olsen_P, SOC, pH),
+                             Out_P[[i]]$pH))
+
+Out_obs_P <- lapply(1:length(Out_obs_P),
+                    function (x)
+                      Out_obs_P[[x]] %>% 
+                      mutate(.,
+                             SPi_obs = SPi_f(fPi, SOC, Olsen_P)) %>% 
+                      mutate(.,
+                             Pi_obs = kgha_f(SPi_obs, NRp, 7, REp)) %>% 
+                      dplyr::select(.,
+                                    fPi, SPi_obs, Pi_obs))
+
+CI_kgP <- lapply(1:length(P_l),
+                 function (x)
+                   data.frame(Pi_est = kgP_l[[x]][[2]],
+                              Pi_LCI = kgP_l[[x]][[1]],
+                              Pi_UCI = kgP_l[[x]][[3]],
+                              Pi_obs = Out_obs_P[[x]]$Pi_obs,
+                              SPi_obs = Out_obs_P[[x]]$SPi_obs,
+                              Sensor = sensor_l[x]) %>% 
+                   mutate(., Pi_CIdiff = Pi_UCI-Pi_LCI))
+
+# cbind estimated soil P supply and observed soil P supply
+Out_all_P <- cbind(do.call("rbind", Out_P),
+                   do.call("rbind", Out_obs_P)[,c("SPi_obs",
+                                                  "Pi_obs")]) # the OLD version of error propagating SD
+
+# New version error propagation based on CIs
+CI_kgP_df <- do.call(rbind, CI_kgP) %>% 
+  group_by(.,
+           Sensor) %>% 
+  mutate(.,
+         MSE = signif(mean((Pi_est-Pi_obs)^2),2),
+         var_E = var((Pi_est-Pi_obs)),
+         RMSE = signif(sqrt(mean((Pi_est-Pi_obs)^2)),2),
+         RMSE_sd = sd(sqrt((Pi_est-Pi_obs)^2)),
+         CCC = epiR::epi.ccc(Pi_est,Pi_obs)$rho.c$est,
+         Bias = signif(mean(Pi_obs - Pi_est),2),
+         SEP = sqrt(sum((Pi_obs-Pi_est)^2)/n()),
+         diff_estp = Pi_obs - Pi_est,
+         mean_p = (Pi_obs + Pi_est)/2,
+         lowerp = mean(diff_estp) - (1.96*sd(diff_estp)), #- mean(Ni_est),
+         upperp = mean(diff_estp) + (1.96*sd(diff_estp)), #- mean(Ni_est),
+         min_CIp = diff_estp - abs(Pi_est - Pi_LCI),
+         max_CIp = diff_estp + abs(Pi_est - Pi_UCI),
+         mmeandiffp = mean(mean(Pi_obs) - mean(Pi_est)),
+         IQ = (quantile(Pi_obs, 
+                        probs = 0.75)-quantile(Pi_obs,
+                                               probs = 0.25))) %>%
+  mutate(.,
+         RPIQ = signif((IQ/SEP),2))
+
+# Compute mean differences
+CI_kgP_df %>% 
+  group_by(.,
+           Sensor) %>% 
+  summarize(.,
+            mean(Pi_obs-Pi_est)) # generally an underestimation
+
+FacetLims <- CI_kgP_df %>%
+  dplyr::group_by(.,Sensor) %>%
+  dplyr::summarize(min = floor(min(Pi_LCI)),
+                   max = ceiling(max(Pi_UCI))) %>%
+  gather(.,range, Pi_obs, -Sensor) %>%
+  dplyr::mutate(Pi_est = Pi_obs, range = NULL)
+
+
+# 1:1 plots
+png(filename = "Fig4.png", width = 6, height = 6, units = "in", res = 400)
+ggplot(CI_kgP_df,
+       aes(Pi_est, Pi_obs))+
+  geom_errorbar(aes(y = Pi_obs,
+                    xmin=Pi_LCI,
+                    xmax=Pi_UCI),
+                color = "darkslategray", alpha = 0.5)+
+  geom_point()+
+  geom_abline(intercept = 0, slope = 1)+
+  geom_blank(data = FacetLims)+
+  geom_text(x = -Inf, y = Inf,
+            label = paste("MSE :",
+                          signif(CI_kgP_df$MSE)),
+            hjust = 0, vjust = 1.25, size = 3, color = "black")+
+  # geom_text(x = -Inf, y = Inf,
+  #           label = paste("CCC :",
+  #                         signif(CI_kgP_df$CCC, 2)),
+  #           hjust = 0, vjust = 2.5, size = 3, color = "black")+
+  geom_text(x = -Inf, y = Inf,
+            label = paste("Bias :",
+                          signif(CI_kgP_df$Bias)),
+            parse = T, hjust = 0, vjust = 2.5, size = 3, color = "black")+
+  # geom_text(x = -Inf, y = Inf,
+  #           label = paste("RPIQ :",
+  #                         signif(CI_kgP_df$RPIQ)),
+  #           parse = T, hjust = 0, vjust = 4.7, size = 3, color = "black")+
+  facet_wrap(~Sensor)+
+  # xlim(-5, 80)+
+  # ylim(-5, 80)+
+  theme_bw()+
+  xlab(c(expression(paste("Fertilizer P based on spectral predictions / kg ",ha^-1))))+
+  ylab(c(expression(paste("Fertilizer P based on conventional analysis / kg ",ha^-1))))
+dev.off()
+
+####Bland-Altman Plot P
+ggplot(CI_kgP_df,
+       aes(mean_p, diff_estp))+
+  geom_errorbar(aes(y = diff_estp,
+                    ymin=min_CIp,
+                    ymax=max_CIp), # These are the upper and lower SDs!
+                color = "darkslategray",
+                alpha = 0.5)+
+  geom_point()+
+  geom_hline(aes(yintercept = mmeandiffp))+
+  geom_hline(aes(yintercept = lowerp), color = "black", linetype="dashed") +
+  geom_hline(aes(yintercept = upperp), color = "black", linetype="dashed") +
+  facet_wrap(~Sensor)+
+  #xlim(10, 80)+
+  #ylim(-50, 30)+
+  # coord_cartesian(ylim=c(-60, 60))+
+  theme_bw()+
+  xlab(c(expression(paste("Mean of fertilizer ",P[conv]," and ",P[spec]," / kg ",ha^-1))))+
+  ylab(c(expression(paste("Fertilizer ",P[conv]-P[spec]," / kg ",ha^-1))))
+```
+
+
+
+---
+title: Sensor_QUEFTS_fertilizer_F.R
+author: asratt
+date: '2024-07-13'
+
+---
